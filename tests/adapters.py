@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import regex as re
-from typing import IO, BinaryIO, Iterable, Optional, Type
+from typing import IO, BinaryIO, Iterable, Optional, Type, Callable
 from collections import defaultdict
 import math
 import numpy.typing as npt
@@ -177,6 +177,7 @@ def run_multihead_self_attention(
 
     return attention # (B, T, D_model)
 
+
 def run_transformer_block(
     d_model: int,
     num_heads: int,
@@ -283,6 +284,7 @@ def run_transformer_block(
     FFN = run_positionwise_feedforward(d_model=d_model, d_ff=d_ff, weights=ffn_weight, in_features=RMSNorm2)
     output = y + dropout(FFN)
     return output
+
 
 def run_transformer_lm(
     vocab_size: int,
@@ -541,10 +543,30 @@ def run_cross_entropy(inputs: torch.FloatTensor, targets: torch.LongTensor):
     Returns:
         Tensor of shape () with the average cross-entropy loss across examples.
     """
-    max_val = inputs.max(dim=-1, keepdim=True).values
-    shifted = inputs - max_val
+    B, C = inputs.shape
     
-
+    # 1. Numerical Stability
+    max_val = inputs.max(dim=-1, keepdim=True).values  # (B, 1)
+    shifted = inputs - max_val                         # (B, 1) broadcasted to (B, C)
+    
+    # 2. Softmax Log-Domain
+    exp_x = torch.exp(shifted)                         # (B, C)
+    sum_exp = torch.sum(exp_x, dim=-1, keepdim=True)   # (B, 1)
+    log_sum_exp = torch.log(sum_exp)                   # (B, 1)
+    
+    # 3. Get target logits
+    batch_indices = torch.arange(B, device=inputs.device)
+    target_logits = shifted[batch_indices, targets] # (B,)
+    
+    # FIX: Reshape target_logits to (B, 1) to align with log_sum_exp
+    target_logits = target_logits.unsqueeze(1) # (B, 1)
+    
+    # 4. Compute Loss
+    # (B, 1) - (B, 1) -> (B, 1)
+    neg_log_prob = log_sum_exp - target_logits 
+    
+    # Average over the batch
+    return neg_log_prob.mean()
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float):
     """Given a set of parameters, clip their combined gradients to have l2 norm at most max_l2_norm.
@@ -562,11 +584,76 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
 
 def get_adamw_cls() -> Type[torch.optim.Optimizer]:
-    """
-    Returns a torch.optim.Optimizer that implements AdamW.
-    """
-    raise NotImplementedError
+    class AdamW(torch.optim.Optimizer):
+        def __init__(
+            self,
+            params,
+            lr: float = 1e-3,
+            betas: tuple[float, float] = (0.9, 0.999),
+            eps: float = 1e-8,
+            weight_decay: float = 0.0,
+        ):
+            if lr < 0.0:
+                raise ValueError(f"Invalid learning rate: {lr}")
+            if not 0.0 <= betas[0] < 1.0:
+                raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+            if not 0.0 <= betas[1] < 1.0:
+                raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+            if eps < 0.0:
+                raise ValueError(f"Invalid epsilon value: {eps}")
+            if weight_decay < 0.0:
+                raise ValueError(f"Invalid weight_decay value: {weight_decay}")
 
+            defaults = {
+                "lr": lr,
+                "betas": betas,
+                "eps": eps,
+                "weight_decay": weight_decay,
+            }
+            super().__init__(params, defaults)
+
+        def step(self, closure: Optional[Callable] = None):
+            loss = None if closure is None else closure()
+
+            for group in self.param_groups:
+                lr = group["lr"]
+                beta1, beta2 = group["betas"]
+                eps = group["eps"]
+                weight_decay = group["weight_decay"]
+
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+
+                    grad = p.grad.data
+                    state = self.state[p]
+
+                    # 1. State Initialization
+                    if len(state) == 0:
+                        state["t"] = 0
+                        state["m"] = torch.zeros_like(p.data)
+                        state["v"] = torch.zeros_like(p.data)
+
+                    # 2. Increment Timestep
+                    state["t"] += 1
+                    t = state["t"]
+
+                    # 3. Update First and Second Moments
+                    m, v = state["m"], state["v"]
+                    m.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                    # 4. Compute Bias-Adjusted Learning Rate
+                    alpha_t = lr * (math.sqrt(1 - (beta2 ** t)) / (1 - (beta1 ** t)))
+
+                    # 5. Update Parameters In-Place
+                    denom = torch.sqrt(v) + eps
+                    p.data.addcdiv_(m, denom, value=-alpha_t)
+                    p.data.add_(p.data, alpha=-lr * weight_decay)
+
+            return loss
+
+    return AdamW
 
 def run_get_lr_cosine_schedule(
     it: int,
@@ -598,7 +685,18 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    # 1. Linear Warm-up Phase
+    if it < warmup_iters:
+        return (it / warmup_iters) * max_learning_rate
+
+    # 2. Cosine Annealing Phase
+    if it <= cosine_cycle_iters:
+        decay_ratio = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return min_learning_rate + coeff * (max_learning_rate - min_learning_rate)
+
+    # 3. Post-Annealing Phase
+    return min_learning_rate
 
 
 def run_save_checkpoint(

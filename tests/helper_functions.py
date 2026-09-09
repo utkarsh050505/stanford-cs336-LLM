@@ -6,6 +6,8 @@ from typing import IO, BinaryIO, Iterable, Optional, Type, List
 from collections import defaultdict
 import json
 import numpy.typing as npt
+import math
+# pyrefly: ignore [missing-import]
 import torch
 import heapq
 
@@ -88,3 +90,14 @@ def pre_tokenizer_train(text: str, special_tokens: list[str]) -> dict[tuple[byte
             pretokens[tuple(bytes([b]) for b in tok.encode("utf-8"))] += 1 # Just split and add, like Hi is b'H' and b'i'
 
     return pretokens # Tuple wih freq
+
+# LEARNING RATE SCHEDULING
+def linear_warmup(t: int, alpha_max: float, T_w: int) -> float:
+    return (t / T_w) * alpha_max
+
+def cosine_annealing(t: int, alpha_max: float, alpha_min: float, T_w: int, T_c: int) -> float:
+    cos_term = math.cos(((t - T_w) / (T_c - T_w)) * math.pi)
+    return alpha_min + 0.5 * (1.0 + cos_term) * (alpha_max - alpha_min)
+
+def post_annealing(alpha_min: float) -> float:
+    return alpha_min
