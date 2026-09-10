@@ -10,6 +10,7 @@ import numpy.typing as npt
 import torch
 import torch.nn as nn
 import heapq
+import numpy as np
 from . import helper_functions, helper_classes
 
 def run_positionwise_feedforward(
@@ -504,7 +505,17 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    max_start_idx = len(dataset) - context_length
+
+    starting_indices = np.random.randint(0, max_start_idx, size=batch_size)
+
+    x_batch = np.stack([dataset[i: i + context_length] for i in starting_indices])
+    y_batch = np.stack([dataset[i + 1: i + 1 + context_length] for i in starting_indices])
+
+    x = torch.tensor(x_batch, dtype=torch.long, device=device)
+    y = torch.tensor(y_batch, dtype=torch.long, device=device)
+
+    return x, y
 
 
 def run_softmax(in_features: torch.FloatTensor, dim: int) -> torch.FloatTensor:
@@ -580,7 +591,15 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
     Returns:
         None
     """
-    raise NotImplementedError
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads: return
+
+    l2_norm = torch.sqrt(sum(g.detach().pow(2).sum() for g in grads))
+
+    if l2_norm > max_l2_norm:
+        scale_factor = (max_l2_norm) / (l2_norm + 1e-6)
+        for g in grads:
+            g.detach().mul_(scale_factor)
 
 
 def get_adamw_cls() -> Type[torch.optim.Optimizer]:
@@ -719,7 +738,12 @@ def run_save_checkpoint(
         out: str | os.PathLike | BinaryIO | IO[bytes]
             Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    checkpoint = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "iteration": iteration
+    }
+    torch.save(checkpoint, out)
 
 
 def run_load_checkpoint(
@@ -743,7 +767,12 @@ def run_load_checkpoint(
     Returns:
         int, the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    checkpoint = torch.load(src)
+
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+
+    return checkpoint["iteration"]
 
 def get_tokenizer(
     vocab: dict[int, bytes],
